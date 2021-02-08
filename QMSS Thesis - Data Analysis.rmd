@@ -1,0 +1,702 @@
+---
+title: "QMSS Thesis - Data Analysis"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+always_allow_html: yes
+---
+
+## Load packages
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(rstanarm)
+library(tidyverse)
+library(tidycensus)
+library(DT)
+library(RColorBrewer)
+library(patchwork)
+library(here)
+library(tigris) 
+library(leaflet)
+library(stringr)
+library(sf)
+library(acs)
+library(stargazer)
+```
+
+## Load datasets
+
+```{r SENSITIVE, include = FALSE}
+password <- "NewYorkNewYorkHa!"
+api_token <- "XEbojP4AoeTCMh9NWUEbhxWcW"
+```
+
+```{r}
+library(RSocrata)
+
+df <- read.socrata(
+  "https://data.cityofchicago.org/resource/iu3g-qa69.csv?$limit=5000000&$offset=0&$order=trip_id",
+  app_token = api_token,
+  email     = "jat2167@columbia.edu",
+  password  = password
+)
+```
+
+```{r}
+df2 <- read.socrata(
+  "https://data.cityofchicago.org/resource/iu3g-qa69.csv?$limit=5000000&$offset=5000000&$order=trip_id",
+  app_token = api_token,
+  email     = "jat2167@columbia.edu",
+  password  = password
+)
+```
+
+```{r}
+full_dataset <- rbind(df, df2)
+
+tnp_df <- sample_n(full_dataset, 1000000, replace = TRUE)
+```
+
+```{r}
+# census_api_key("889130ce48c84e2c04ff9b54b947c23593008dac", install = TRUE)
+# First time, reload your environment so you can use the key without restarting R.
+# readRenviron("~/.Renviron")
+# You can check it with:
+# Sys.getenv("889130ce48c84e2c04ff9b54b947c23593008dac")
+```
+
+```{r}
+# tnp_df <- read_csv("QMSS Thesis - Sample.csv")
+
+tnp_df <- tnp_df %>%
+  rename("GEOID" = "dropoff_census_tract") 
+
+census <- get_acs(geography = "tract", 
+                  variables = c(Poverty = "B17001_002", # number of those in poverty  
+                                Population = "B01003_001E", # total population 
+                                `Median Income` = "B19326_001E",
+                                Black = "B02001_003E",
+                                White = "B02001_002E",
+                                Car = "B08601_003E",
+                                Carpool = "B08601_004E",
+                                `Public Transport` = "B08601_010E",
+                                Taxi = "B08601_016E",
+                                `Travel Time` = "B08603_001E"
+                                ), 
+                  state = "IL", 
+                  geometry = TRUE, 
+                  output = "wide")
+
+census <- census %>%
+  mutate(`Poverty Rate` = (PovertyE/Population) * 100) %>%
+  mutate(`Percent Black` = (Black/Population) * 100) %>%
+  mutate(`Percent White` = (White/Population) * 100)
+
+tnp_df$GEOID <- as.character(tnp_df$GEOID)
+joined_df <- left_join(tnp_df, census, by = "GEOID")
+
+joined_df <- joined_df %>% 
+  select(-PovertyM, -B01003_001M, -B19326_001M, -B02001_002M, -B02001_003M, -B08601_003M, -B08601_004M, -B08601_010M, -B08601_016M, -B08603_001M) %>%
+  rename("Poverty" = "PovertyE") %>%
+  rename("Name" = "NAME") %>%
+  mutate(`canceled_bool` = (ifelse(fare > 0, 0, 1))) 
+
+joined_df <- joined_df %>% 
+  add_count(GEOID) %>%
+  rename("Number of trips/GEOID" = "n")
+
+joined_df <- joined_df %>% 
+  add_count(GEOID, joined_df$shared_trip_authorized == TRUE) %>%
+  rename("Number of Shared Trips Auth by GEOID" = "n")
+
+# median income per census tract, Chicago 
+med_inc <- joined_df %>% group_by(Name) %>% summarize(`Mean Income` = mean(as.numeric(`Median Income`)))
+
+# average fare per census tract 
+avg_fare <- joined_df %>% group_by(Name) %>% summarize(`Mean fare` = mean(fare))
+
+# average trip time per census tract 
+avg_time <- joined_df %>% group_by(Name) %>% summarize(`Mean Trip in Seconds` = mean(trip_seconds))
+
+# amount of trips beginning at certain times 
+joined_df$Trip_Start <- str_extract(joined_df$trip_start_timestamp, '\\d{2}:\\d{2}:\\d{2}')
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start,
+                                    "(04|05|06|07|08|09):\\d{2}:\\d{2}", 
+                                    "Morning")
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start, 
+                                    "(10|11):\\d{2}:\\d{2}", 
+                                    "Late Morning")
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start, 
+                                    "(12|13|14|15):\\d{2}:\\d{2}", 
+                                    "Early Afternoon")
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start, 
+                                    "(16|17|18|19):\\d{2}:\\d{2}", 
+                                    "Evening")
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start, 
+                                    "(20|21|22|23):\\d{2}:\\d{2}", 
+                                    "Night")
+joined_df$Trip_Start <- str_replace(joined_df$Trip_Start, 
+                                    "(00|01|02|03):\\d{2}:\\d{2}", 
+                                    "Late Night/Early Morning")
+
+joined_df$`Median Income Category` <- cut(joined_df$`Median Income` , 5, labels=c('Low Income', 'Low-Medium Income', 'Medium Income', 'Medium-High Income', 'High Income')) 
+
+joined_df$trip_minutes <- (joined_df$trip_seconds / 60)
+
+# trip minutes weighted by popularity of area 
+total_trips <- sum(joined_df$`Number of trips/GEOID`)
+
+options(digits=10)
+joined_df <- joined_df %>% mutate("popularity_weight" = (1 + (joined_df$`Number of trips/GEOID`/total_trips)))
+
+joined_df$weighted_trip_min <- joined_df$trip_minutes*joined_df$popularity_weight
+
+trip_start <- joined_df %>% 
+  group_by(Trip_Start) %>% 
+  tally(sort = TRUE) %>%
+  rename("Number of Trips" = "n")
+
+# popular and unpopular dates 
+joined_df$date <- str_extract(joined_df$trip_start_timestamp, '\\d{4}-\\d{2}-\\d{2}')
+dates <- joined_df %>% 
+  group_by(date) %>%
+  tally(sort = TRUE) %>%
+  rename("Amount of Trips per Day" = "n")
+```
+
+## Descriptive Stats
+
+```{r, results='asis'}
+top_10_dates <- head(dates, n = 10)
+bottom_10_dates <- tail(dates, n = 10)
+
+# number of pooled trips
+num_pooled <- joined_df %>% group_by(Name) %>% tally(trips_pooled > 1, sort = TRUE)
+
+# number of shares authorized 
+num_shared <- joined_df %>% 
+  group_by(Name) %>% 
+  tally(shared_trip_authorized == 'false') %>%
+  rename("Number of Authorized Shared Trips" = "n")
+
+# number of miles 
+num_miles <- joined_df %>% 
+  group_by(Name) %>% 
+  summarize(`Avg. Miles` = mean(trip_miles))
+
+join_tract_1 <- left_join(med_inc, avg_fare)
+join_tract_2 <- left_join(avg_time, num_pooled)
+join_tract_3 <- left_join(num_shared, num_miles)
+join_tract_4 <- left_join(join_tract_1, join_tract_2)
+full_tract_stats <- left_join(join_tract_3, join_tract_4)
+
+full_tract_stats <- full_tract_stats %>% 
+  rename("Mean Census Tract Income" = "Mean Income") %>%
+  rename("Mean Trip Fare" = "Mean fare") %>%
+  rename("Number of Trips Pooled" = "n") %>% 
+  rename("Census Tract" = "Name") %>%
+  rename("Trip Time in Seconds" = "Mean Trip in Seconds")
+
+full_tract_stats <- full_tract_stats[order(full_tract_stats$`Mean Census Tract Income`), ]
+
+full_tract_stats$Income_Level <- cut(full_tract_stats$`Mean Census Tract Income`, 5, labels=c('Low Income', 'Low-Medium Income', 'Medium Income', 'Medium-High Income', 'High Income')) 
+
+full_tract_stats$`Census Tract` <- str_extract(full_tract_stats$`Census Tract`, "Census Tract \\d{3,}")
+
+income <- full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Mean Income` = mean(as.numeric(`Mean Census Tract Income`)))
+income <- na.omit(income)
+
+fare <- full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Mean Fare` = mean(as.numeric(`Mean Trip Fare`))) 
+fare <- na.omit(fare)
+  
+time <- full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Avg. Trip Time in Seconds` = mean(as.numeric(`Trip Time in Seconds`), na.rm = TRUE))
+time <- na.omit(time)
+
+pooled <- full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Avg. Pooled Trips` = mean(as.numeric(`Number of Trips Pooled`)))
+pooled <- na.omit(pooled)
+
+shared <- full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Avg. Num of Authorized Shared Trips` = mean(as.numeric(`Number of Authorized Shared Trips`), na.rm = TRUE))
+shared <- na.omit(shared)
+
+miles <-full_tract_stats %>%
+  group_by(Income_Level) %>%
+  summarize(`Avg. Trip Miles` = mean(as.numeric(`Avg. Miles`), na.rm = TRUE)) 
+miles <- na.omit(miles)
+
+stargazer(income, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(fare, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(time, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(trip_start, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(top_10_dates, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(bottom_10_dates, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(pooled, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(shared, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+stargazer(miles, summary=FALSE, rownames=FALSE, header=FALSE, type='latex')
+```
+
+```{r}
+ggplot(data = income, aes(x = Income_Level, y = `Mean Income`)) +
+  geom_bar(stat="identity", fill="purple", position=position_dodge()) +
+  theme_minimal() 
+
+ggplot(data = fare, aes(x = Income_Level, y = `Mean Fare`)) +
+  geom_bar(stat="identity", fill="black", position=position_dodge()) +
+  theme_minimal() 
+
+ggplot(data = time, aes(x = Income_Level, y = `Avg. Trip Time in Seconds`)) +
+  geom_bar(stat="identity", fill="dark blue", position=position_dodge()) +
+  theme_minimal() 
+
+ggplot(data = trip_start, aes(x = reorder(Trip_Start, `Number of Trips`), y = `Number of Trips`)) +
+  geom_bar(stat = "identity", fill="dark blue") +
+  theme_minimal() + 
+  xlab("Trip Start Time") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+ggplot(data = pooled, aes(x = Income_Level, y = `Avg. Pooled Trips`)) +
+  geom_bar(stat="identity", fill="pink", position=position_dodge()) +
+  theme_minimal() 
+
+ggplot(data = shared, aes(x = Income_Level, y = `Avg. Num of Authorized Shared Trips`)) +
+  geom_bar(stat="identity", fill="pink", position=position_dodge()) +
+  theme_minimal() 
+
+miles$`Avg. Trip Miles` <- as.numeric(as.character(miles$`Avg. Trip Miles`))
+  
+ggplot(data = miles, aes(x = Income_Level, y = `Avg. Trip Miles`)) + 
+  geom_count(aes(size = Income_Level), color = "#00FF00") + 
+  theme_minimal() + 
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  ggtitle("Average Miles per Trip per Income Level (Dropoff Location)")
+
+ggplot(data = top_10_dates, aes(x = date, y = `Amount of Trips per Day`)) + 
+  geom_line(aes(group=1), color = "#bab86c", size=2, alpha=0.9, linetype=2) + 
+  geom_point() +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ggtitle("Amount of Trips for Top 10 Dates")
+```
+
+```{r, results='asis'}
+fit <- lm(fare ~ `Poverty Rate` + 
+                  `Percent Black` + 
+                  `Poverty Rate`:`Percent Black`, 
+                data = joined_df)
+```
+
+```{r, results='asis'}
+fit_1 <- lm(fare ~ `Percent White`, 
+                data = joined_df)
+
+stargazer(fit, fit_1, title="Fare", align=TRUE, header=FALSE, type='latex')
+```
+
+```{r, results='asis'}
+fit_2 <- lm(trip_seconds ~ `Poverty Rate` + 
+                    `Percent Black` + 
+                    `Poverty Rate`:`Percent Black`, 
+                  data = joined_df)
+```
+
+```{r, results='asis'}
+fit_3 <- lm(trip_seconds ~ `Percent White`, 
+                data = joined_df)
+
+print(fit_3, digits = 5)
+
+stargazer(fit_2, fit_3, title="Trip Seconds", align=TRUE, header=FALSE, type='latex')
+```
+
+```{r, results='asis'}
+fit_4 <- lm(trips_pooled ~ `Poverty Rate` + 
+                    `Percent Black` + 
+                    `Poverty Rate`:`Percent Black`, 
+                  data = joined_df)
+```
+
+```{r, results='asis'}
+fit_5 <- lm(trips_pooled ~ 
+                    `Percent White`, 
+                  data = joined_df)
+
+stargazer(fit_4, fit_5, title="Trips Pooled", align=TRUE, header=FALSE, type='latex')
+```
+
+```{r, results='asis'}
+fit_6 <- glm(canceled_bool ~ `Poverty Rate` + 
+                    `Percent Black` + 
+                    `Poverty Rate`:`Percent Black`, 
+                  data = joined_df, 
+            family = binomial(link = "logit"))
+```
+
+```{r, results='asis'}
+fit_7 <- glm(canceled_bool ~ 
+                    `Percent White`, 
+                  data = joined_df, 
+             family = binomial(link = "logit"))
+
+stargazer(fit_6, fit_7, title="Canceled Rides", align=TRUE, header=FALSE, type='latex')
+```
+
+```{r}
+ggplot(joined_df, aes(x = fare, y = `Poverty Rate`, group = fare)) + 
+  geom_boxplot() +  
+  xlim(0, 50) + 
+  ylim(0, 40) +
+  labs(title = "Fare vs. Poverty Rate", 
+       x = "Fare",
+       y = "Poverty Rate")
+
+ggplot(joined_df, aes(x = trip_minutes, y = `Poverty Rate`)) + 
+  geom_hex() +
+  labs(title = "Trip Minutes vs. Poverty Rate", 
+       x = "Trip Minutes",
+       y = "Poverty Rate") 
+
+ggplot(joined_df, aes(x = trips_pooled, y = `Poverty Rate`, group = trips_pooled)) + 
+  geom_boxplot() + 
+  labs(title = "Trips Pooled vs. Poverty Rate", 
+       x = "Pooled Trips (Number of Riders)",
+       y = "Poverty Rate")
+
+ggplot(joined_df, aes(x = canceled_bool, y = `Poverty Rate`, group = canceled_bool)) + 
+  geom_boxplot() + 
+  labs(title = "canceled Ride vs. Poverty Rate", 
+       x = "Canceled Ride: Yes or No?",
+       y = "Poverty Rate") 
+```
+
+```{r, results='asis'}
+fit_8 <- lm(`Mean Census Tract Income` ~ `Mean Trip Fare` + `Number of Trips Pooled`, 
+                  data = full_tract_stats)
+```
+
+```{r, results='asis'}
+library(caret)
+fit_9 <- lm(`Mean Census Tract Income` ~ `Mean Trip Fare` + I(`Mean Trip Fare`^2), data = full_tract_stats)
+```
+
+```{r, results='asis'}
+library(stats)
+
+full_tract_stats <- full_tract_stats %>%
+  filter(`Mean Trip Fare` >= 8) %>%
+  filter(`Mean Trip Fare` <= 20)
+
+full_lo <- full_tract_stats %>%
+  select(`Mean Trip Fare`, `Mean Census Tract Income`)
+
+full_lo$Index <- 1:nrow(full_lo)
+```
+
+```{r, results='asis'}
+fit_10 <- loess(`Mean Trip Fare` ~ full_lo$`Mean Trip Fare`, data = full_lo)
+```
+
+```{r, results='asis'}
+stargazer(fit_8, fit_9, title="Mean Income vs. Mean Fare", align=TRUE, header=FALSE, type='latex')
+```
+
+```{r, results='asis'}
+library(jtools)
+
+summary(fit_10)
+```
+
+```{r}
+ggplot(full_tract_stats, 
+       aes(x = `Mean Trip Fare`, y = `Mean Census Tract Income`, color = `Number of Trips Pooled`)) +
+  geom_point() +
+  geom_smooth(method = "loess") + 
+  scale_color_gradient(low = "light blue", high = "red", na.value = NA, limits = c(0, 1000)) +
+  xlim(8, 20)
+```
+
+## Mapping
+
+```{r}
+tracts <- tracts("IL", "Cook", cb=TRUE)
+merged <- geo_join(tracts, joined_df, "GEOID", "GEOID")
+
+popup <- paste0("GEOID: ", merged$GEOID, "<br>", "Median Income: ", merged$`Median Income Category`)
+
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$`Median Income`,
+  na.color = "transparent"
+)
+
+map_income <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(`Median Income`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$`Median Income`, 
+            position = "bottomright", 
+            title = "Median Income by Census Tract") 
+map_income
+```
+
+```{r}
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$`Poverty Rate`,
+  na.color = "transparent"
+)
+
+map_pov <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(`Poverty Rate`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$`Poverty Rate`, 
+            position = "bottomright", 
+            title = "Poverty Rate by Census Tract") 
+map_pov
+```
+
+```{r}
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$`Percent Black`,
+  na.color = "transparent"
+)
+
+map_black <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(`Percent Black`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$`Percent Black`, 
+            position = "bottomright", 
+            title = "Percent Black by Census Tract") 
+map_black
+```
+
+```{r}
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$`Percent White`,
+  na.color = "transparent"
+)
+
+map_white <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(`Percent White`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$`Percent White`, 
+            position = "bottomright", 
+            title = "Percent White by Census Tract") 
+map_white
+```
+
+```{r}
+popup <- paste0("GEOID: ", merged$GEOID, "<br>", "Median Income: ", merged$`Median Income Category`)
+
+total_pop <- sum(merged$Population, na.rm = TRUE)
+
+options(digits=10)
+merged <- merged %>% mutate("pop_weight" = 1 + (Population/total_pop))
+
+merged <- merged %>% 
+  mutate("Fare Weighted by Population" = fare*pop_weight)
+
+merged_fare <- merged %>%
+  filter(`Fare Weighted by Population` < 30) 
+
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged_fare$`Fare Weighted by Population`, # weighted for population
+  na.color = "transparent"
+)
+
+map_fare <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged_fare, 
+              fillColor = ~pal(`Fare Weighted by Population`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged_fare$`Fare Weighted by Population`, 
+            position = "bottomright", 
+            title = "Average Trip Fare (as a Function of Population) by Census Tract") 
+map_fare
+```
+
+```{r}
+merged_2 <- merged[order(merged$weighted_trip_min), ] 
+
+merged_2 <- merged_2 %>%
+  filter(weighted_trip_min <= 60)
+
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged_2$weighted_trip_min, 
+  na.color = "transparent"
+)
+
+map_time <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged_2, 
+              fillColor = ~pal(weighted_trip_min), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged_2$weighted_trip_min, 
+            position = "bottomright", 
+            title = "Average Travel Time (in minutes) by Census Tract") 
+map_time
+```
+
+```{r}
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$trips_pooled, 
+  na.color = "transparent"
+)
+
+map_pooled <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(trips_pooled), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$trips_pooled, 
+            position = "bottomright", 
+            title = "Average Number of Trips Pooled by Census Tract") 
+map_pooled
+```
+
+```{r}
+popup <- paste0("GEOID: ", merged$GEOID, "<br>", "Median Income: ", merged$`Median Income Category`,
+               "<br>", "Number of Shared Trips: ", merged$`Number of Shared Trips Auth by GEOID`)
+
+pal <- colorNumeric(
+  palette = "RdYlGn",
+  domain = merged$`Number of Shared Trips Auth by GEOID`, 
+  na.color = "transparent"
+)
+
+map_shared_trip <- leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = merged, 
+              fillColor = ~pal(`Number of Shared Trips Auth by GEOID`), 
+              color = "transparent", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = merged$`Number of Shared Trips Auth by GEOID`, 
+            position = "bottomright", 
+            title = "Shared Trip Authorized: Yes or No?") 
+
+map_shared_trip
+```
+
+## Modeling 
+
+```{r}
+library(caret)
+library(purrr)
+library(readr)
+library(XML)
+library(xml2)
+
+set.seed(2021)
+modeling_df <- joined_df %>%
+  mutate(y = (ifelse(fare == 0, 0, 1))) %>% # 0 is ride canceled, 1 is not canceled 
+  select(-trip_id, -geometry, -canceled_bool, -pickup_census_tract, -pickup_community_area, -pickup_community_area, -dropoff_community_area, -Car, -Carpool, -`Public Transport`, -`Taxi`, -`Travel Time`) %>% # drop irrelevant variables 
+  na.omit(joined_df)
+
+modeling_df <- select_if(modeling_df, is.numeric)
+
+modeling_df <- sample_n(modeling_df, 10000, replace = TRUE)
+
+modeling_df$y <- factor(modeling_df$y, labels = c("yes", "no"), levels = 1:0)
+
+in_train <- createDataPartition(y = modeling_df$y, p = 0.8, list = FALSE)
+training <- modeling_df[ in_train, ]
+testing  <- modeling_df[-in_train, ]
+
+summary(training)
+```
+
+```{r}
+logit <- glm(y == "no" ~ fare + trip_seconds + trips_pooled + Population + `Median Income` + `Percent Black` + `Poverty Rate`, data = training, family = binomial(link = "logit"))
+
+y_hat_logit <- predict(logit, newdata = testing, type = "response") # these are probabilities
+# these are classifications
+z_logit <- factor(y_hat_logit > 0.5, levels = c(TRUE, FALSE), labels = c("yes", "no")) 
+table(z_logit, testing$y)
+```
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", repeats = 3, 
+                     classProbs = TRUE, summaryFunction = twoClassSummary)
+
+tune_grid <- expand.grid(.alpha = seq(0, 1, length.out = 10),
+                         .lambda = seq(0, 1, length.out = 10))
+
+penalized_logit <- train(y ~ Population + `Median Income` + `Percent Black` + `Poverty Rate`, 
+                         data = training, 
+                         method = "glmnet", 
+                         trControl = ctrl, 
+                         metric = "ROC", 
+                         tuneGrid = tune_grid,
+                         preProcess = c("center", "scale"))
+
+y_hat_penalized_logit <- predict(penalized_logit, newdata = testing, type = "prob")$no
+
+# above are probabilities, below are classifications
+z <- predict(penalized_logit, newdata = testing) 
+defaultSummary(data.frame(obs = testing$y, pred = z))
+
+confusionMatrix(z, reference = testing$y)
+```
